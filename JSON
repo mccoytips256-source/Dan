@@ -1,0 +1,203 @@
+import fs from "node:fs/promises";
+
+const KEY = process.env.FOOTBALL_API_KEY;
+if (!KEY) {
+  console.error("Missing FOOTBALL_API_KEY env var");
+  process.exit(1);
+}
+
+const BASE = "https://api.football-data.org/v4";
+const HEADERS = { "X-Auth-Token": KEY };
+
+const LEAGUES = [
+  { code: "PL",  name: "Premier League", country: "England" },
+  { code: "PD",  name: "La Liga",        country: "Spain" },
+  { code: "BL1", name: "Bundesliga",     country: "Germany" },
+  { code: "SA",  name: "Serie A",        country: "Italy" },
+  { code: "FL1", name: "Ligue 1",        country: "France" },
+  { code: "DED", name: "Eredivisie",     country: "Netherlands" },
+  { code: "PPL", name: "Primeira Liga",  country: "Portugal" },
+  { code: "ELC", name: "Championship",   country: "England" },
+];
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function get(path) {
+  const r = await fetch(BASE + path, { headers: HEADERS });
+  if (!r.ok) throw new Error(`${path} -> ${r.status}`);
+  return r.json();
+}
+
+function todayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function fetchLeague(league) {
+  const matches = await get(`/competitions/${league.code}/matches?season=2025`);
+  await sleep(6500);
+  const standings = await get(`/competitions/${league.code}/standings`);
+  await sleep(6500);
+  return {
+    league,
+    matches: matches.matches ?? [],
+    standings: standings.standings?.[0]?.table ?? [],
+  };
+}
+
+async function main() {
+  await fs.mkdir("data", { recursive: true });
+
+  const today = todayISO();
+  const results = [];
+  const allMatches = [];
+
+  for (const league of LEAGUES) {
+    try {
+      const data = await fetchLeague(league);
+      results.push(data);
+      allMatches.push(
+        ...data.matches.map((m) => ({
+          ...m,
+          league: league.code,
+          leagueName: league.name,
+        }))
+      );
+      console.log(`✓ ${league.name}: ${data.matches.length} matches`);
+    } catch (e) {
+      console.error(`✗ ${league.name}: ${e.message}`);
+    }
+  }
+
+  // ---- per-league analytics ----
+  const leagueStats = results.map(({ league, matches }) => {
+    const played = matches.filter((m) => m.status === "FINISHED");
+    const goals = played.reduce(
+      (s, m) => s + m.score.fullTime.home + m.score.fullTime.away,
+      0
+    );
+    const avgGoals = played.length ? goals / played.length : 0;
+
+    const homeWins = played.filter(
+      (m) => m.score.fullTime.home > m.score.fullTime.away
+    ).length;
+    const homeWinPct = played.length ? (homeWins / played.length) * 100 : 0;
+
+    const btts = played.filter(
+      (m) => m.score.fullTime.home > 0 && m.score.fullTime.away > 0
+    ).length;
+    const bttsPct = played.length ? (btts / played.length) * 100 : 0;
+
+    const over25 = played.filter(
+      (m) => m.score.fullTime.home + m.score.fullTime.away > 2.5
+    ).length;
+    const over25Pct = played.length ? (over25 / played.length) * 100 : 0;
+
+    return {
+      ...league,
+      played: played.length,
+      avgGoals: +avgGoals.toFixed(2),
+      homeWinPct: +homeWinPct.toFixed(1),
+      bttsPct: +bttsPct.toFixed(1),
+      over25Pct: +over25Pct.toFixed(1),
+    };
+  });
+
+  // ---- team goals ----
+  const teamGoals = {};
+  for (const m of allMatches) {
+    if (m.status !== "FINISHED") continue;
+    const h = m.homeTeam.name;
+    const a = m.awayTeam.name;
+    const hs = m.score.fullTime.home;
+    const as = m.score.fullTime.away;
+
+    teamGoals[h] ??= { team: h, league: m.leagueName, scored: 0, conceded: 0, played: 0 };
+    teamGoals[a] ??= { team: a, league: m.leagueName, scored: 0, conceded: 0, played: 0 };
+
+    teamGoals[h].scored += hs;
+    teamGoals[h].conceded += as;
+    teamGoals[h].played++;
+    teamGoals[a].scored += as;
+    teamGoals[a].conceded += hs;
+    teamGoals[a].played++;
+  }
+
+  const teamList = Object.values(teamGoals)
+    .map((t) => ({
+      ...t,
+      gpg: +(t.scored / t.played).toFixed(2),
+      cpg: +(t.conceded / t.played).toFixed(2),
+    }))
+    .sort((a, b) => b.gpg - a.gpg);
+
+  // ---- today's fixtures ----
+  const todaysFixtures = allMatches
+    .filter((m) => m.utcDate.startsWith(today))
+    .map((m) => {
+      const home = teamGoals[m.homeTeam.name];
+      const away = teamGoals[m.awayTeam.name];
+      const homeGpg = home ? home.gpg : 0;
+      const awayGpg = away ? away.gpg : 0;
+      const homeCpg = home ? home.cpg : 0;
+      const awayCpg = away ? away.cpg : 0;
+      const projHome = (homeGpg + awayCpg) / 2;
+      const projAway = (awayGpg + homeCpg) / 2;
+      const projTotal = +(projHome + projAway).toFixed(2);
+
+      return {
+        id: m.id,
+        league: m.leagueName,
+        leagueCode: m.league,
+        utcDate: m.utcDate,
+        status: m.status,
+        home: m.homeTeam.name,
+        away: m.awayTeam.name,
+        homeGpg,
+        awayGpg,
+        projTotal,
+      };
+    })
+    .sort((a, b) => b.projTotal - a.projTotal);
+
+  // ---- persist ----
+  await fs.writeFile("data/leagues.json", JSON.stringify(leagueStats, null, 2));
+  await fs.writeFile("data/teams.json", JSON.stringify(teamList, null, 2));
+  await fs.writeFile("data/fixtures-today.json", JSON.stringify(todaysFixtures, null, 2));
+  await fs.writeFile(
+    "data/matches.json",
+    JSON.stringify(
+      allMatches.map((m) => ({
+        id: m.id,
+        league: m.league,
+        leagueName: m.leagueName,
+        utcDate: m.utcDate,
+        status: m.status,
+        home: m.homeTeam.name,
+        away: m.awayTeam.name,
+        score: m.score.fullTime,
+      })),
+      null,
+      2
+    )
+  );
+  await fs.writeFile(
+    "data/meta.json",
+    JSON.stringify(
+      {
+        updatedAt: new Date().toISOString(),
+        leagues: LEAGUES.length,
+        totalMatches: allMatches.length,
+        todayFixtures: todaysFixtures.length,
+      },
+      null,
+      2
+    )
+  );
+
+  console.log(`\nDone. Today's fixtures: ${todaysFixtures.length}`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
